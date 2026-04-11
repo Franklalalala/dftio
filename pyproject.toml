@@ -22,7 +22,6 @@ dargs = "0.4.4"
 e3nn = ">=0.5.1"
 h5py = ">=3.7.0,<=3.11.0,!=3.10.0"
 lmdb = "1.4.1"
-sisl = ">=0.14.3"
 dpdata = ">=0.2.20"
 torch_scatter = "2.1.2"
 tqdm = "*"
@@ -38,7 +37,7 @@ build-backend = "poetry_dynamic_versioning.backend"
 [tool.poetry-dynamic-versioning]
 enable = true
 vcs = "git"
-strict = true
+strict = false
 format-jinja = """
     {%- if distance == 0 -%}
         {{ serialize_pep440(base, stage, revision) }}

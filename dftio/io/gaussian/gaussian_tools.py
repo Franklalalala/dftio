@@ -5,16 +5,22 @@ import re
 import shutil
 from collections import Counter
 from pprint import pprint
+import warnings
+import ase
+from ase.db import connect
 
 import matplotlib.pyplot as plt
 import numpy as np
 from ase import Atoms, Atom
+from typing import Union, List, Dict, Any, Set
 
-from dftio.io.gaussian.gaussian_conventions import orbital_idx_map
+from .gaussian_conventions import orbital_idx_map
+from emoles.fchk_parser import read_fchk
 
 
 def chk_valid_gau_log_unit(file_path, hamiltonian=False, overlap=False, density_matrix=False,
                            is_fixed_convention=False):
+    print('Start parsing {}'.format(file_path))
     required_patterns = [
         r"Standard orientation:",
         r"NBasis=",
@@ -43,29 +49,60 @@ def chk_valid_gau_log_unit(file_path, hamiltonian=False, overlap=False, density_
                 if not found_patterns[i] and pattern.search(line):
                     found_patterns[i] = True
     if all(found_patterns):
+        print('All patterns parsed successfully for {}'.format(file_path))
         return True
     else:
+        print('Patterns not parsed successfully for {}'.format(file_path))
         return False
 
 
-def chk_valid_gau_logs(root, prefix, hamiltonian=False, overlap=False, density_matrix=False, is_fixed_convention=False,
-                       valid_gau_info_path=r'./valid_gaussian_logs.txt',
-                       invalid_gau_info_path=r'./invalid_gau_info_path.txt'):
-    file_paths = glob.glob(root + '/*' + prefix + '*')
+def chk_valid_gau_logs(
+    root,
+    filename,
+    hamiltonian=False,
+    overlap=False,
+    density_matrix=False,
+    is_fixed_convention=False,
+    valid_gau_info_path='./valid_gaussian_logs.txt',
+    invalid_gau_info_path='./invalid_gaussian_logs.txt',
+):
+    """
+    Traverse the directory tree starting at `root`, find all files containing `filename` in their name,
+    and check each with `chk_valid_gau_log_unit`. Valid and invalid paths are written to separate log files.
+    """
     valid_count = 0
     invalid_count = 0
-    with open(valid_gau_info_path, 'a') as valid_file, open(invalid_gau_info_path, 'a') as invalid_file:
-        for a_file in file_paths:
-            if chk_valid_gau_log_unit(a_file, hamiltonian, overlap, density_matrix, is_fixed_convention):
-                valid_file.write(f"{a_file}\n")
-                valid_count += 1
-            else:
-                invalid_file.write(f"{a_file}\n")
-                invalid_count += 1
+
+    # Ensure output files exist and open in append mode
+    with open(valid_gau_info_path, 'a') as valid_file, \
+         open(invalid_gau_info_path, 'a') as invalid_file:
+
+        # Walk through all directories and subdirectories
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                if filename in fname:
+                    a_file = os.path.join(dirpath, fname)
+
+                    # Perform the validity check
+                    if chk_valid_gau_log_unit(
+                        a_file,
+                        hamiltonian=hamiltonian,
+                        overlap=overlap,
+                        density_matrix=density_matrix,
+                        is_fixed_convention=is_fixed_convention
+                    ):
+                        valid_file.write(f"{a_file}\n")
+                        valid_count += 1
+                    else:
+                        invalid_file.write(f"{a_file}\n")
+                        invalid_count += 1
+
+    # Summary
     print(f"Valid Gaussian log files: {valid_count}")
     print(f"Invalid Gaussian log files: {invalid_count}")
     print(f"Valid file paths written to: {valid_gau_info_path}")
     print(f"Invalid file paths written to: {invalid_gau_info_path}")
+
 
 
 def split_files_by_atoms(file_list_path, output_train_path, output_valid_path, output_test_path):
@@ -138,8 +175,11 @@ def get_nbasis(file_path):
     for line in lines:
         # Extract NBasis
         if line.strip().startswith("NBasis"):
-            nbasis = int(line.split()[2])
-            break
+            # 直接匹配第一个出现的连续数字
+            match = re.search(r"\d+", line)
+            if match:
+                nbasis = int(match.group(0)) # 恢复使用 group(0)
+                break
     if nbasis is None:
         print("NBasis keyword not found in the log file.")
     return nbasis
@@ -173,9 +213,10 @@ def get_basic_info(file_path):
     for line in lines[idx:]:
         # Extract NBasis
         if line.strip().startswith("NBasis"):
-            match = re.search(r"\b\d+\b", line)
+            # 直接匹配第一个出现的连续数字
+            match = re.search(r"\d+", line)
             if match:
-                nbasis = int(match.group(0))
+                nbasis = int(match.group(0)) # 恢复使用 group(0)
                 break
     if nbasis is None:
         raise RuntimeError("NBasis keyword not found in the log file.")
@@ -508,23 +549,187 @@ def get_atoms(file_path):
     return atoms
 
 
+def get_minimal_log_paths_for_all_elements(db_path: str, results_root: str) -> List[str]:
+    """
+    Scans an ASE DB to find a minimal set of log files that covers all unique elements.
+
+    This function performs three main steps:
+    1. Scans the database to gather information about all structures (elements, spin, charge).
+    2. Uses a greedy algorithm to find the smallest set of IDs covering all elements.
+    3. Traverses the 'results_root' directory to find the log files corresponding to these IDs,
+       even if they are deeply nested.
+
+    Args:
+        db_path (str): Path to the ASE database file.
+        results_root (str): The root directory where calculation results are stored.
+
+    Returns:
+        List[str]: A list of absolute paths to the necessary log files.
+    """
+    # --- 1. Scan DB once to collect all necessary data (No changes here) ---
+    all_elements: Set[str] = set()
+    id_info: Dict[int, Dict[str, Any]] = {}
+    print(f"Connecting to ASE database at: {db_path}")
+    try:
+        with connect(db_path) as db:
+            print("Scanning database for structure information...")
+            for row in db.select():
+                if not all(hasattr(row, key) for key in ['real_id', 'real_spin', 'real_charge', 'symbols']):
+                    warnings.warn(f"Row id={row.id} is missing required keys. Skipping.")
+                    continue
+
+                real_id = row.real_id
+                elements = set(row.symbols)
+                all_elements.update(elements)
+                id_info[real_id] = {
+                    'elements': elements,
+                    'spin': row.real_spin,
+                    'charge': row.real_charge,
+                }
+    except Exception as e:
+        print(f"Error processing database: {e}")
+        return []
+
+    if not id_info:
+        print("No valid entries with required keys found in the database.")
+        return []
+
+    # --- 2. Greedy algorithm to find minimal set of IDs (No changes here) ---
+    uncovered_elements = all_elements.copy()
+    minimal_ids: List[int] = []
+    print(f"\nTotal unique elements to cover: {sorted(list(uncovered_elements))}")
+
+    while uncovered_elements:
+        best_id, max_coverage = -1, 0
+        for real_id, info in id_info.items():
+            if real_id in minimal_ids: continue
+            newly_covered_count = len(uncovered_elements.intersection(info['elements']))
+            if newly_covered_count > max_coverage:
+                max_coverage = newly_covered_count
+                best_id = real_id
+
+        if best_id != -1:
+            covered = uncovered_elements.intersection(id_info[best_id]['elements'])
+            minimal_ids.append(best_id)
+            uncovered_elements -= covered
+            print(f"  - Selected ID: {best_id}, covers new: {sorted(list(covered))}. "
+                  f"Remaining: {len(uncovered_elements)}")
+        else:
+            print("No more elements can be covered. Stopping.")
+            break
+
+    print(f"\nMinimal set of IDs found: {minimal_ids}")
+
+    # --- 3. Construct log file paths using os.walk() (This part is modified) ---
+
+    # First, walk the directory tree ONCE to build a map of folder names to their full paths.
+    # This is much more efficient than walking the tree for each ID.
+    print(f"\nScanning file system under '{results_root}' to map job folders. This may take a while...")
+    folder_path_map: Dict[str, str] = {}
+    for dirpath, dirnames, _ in os.walk(results_root):
+        # We only look at directory names that match our pattern.
+        for dirname in dirnames:
+            if dirname.startswith('id_') and '_spin_' in dirname and '_charge_' in dirname:
+                folder_path_map[dirname] = os.path.join(dirpath, dirname)
+
+    print(f"Found {len(folder_path_map)} potential job folders.")
+
+    # Now, use the pre-built map to find the paths for our minimal set of IDs.
+    log_paths: List[str] = []
+    print("\nLocating corresponding log files from the file system map...")
+    for real_id in minimal_ids:
+        info = id_info[real_id]
+        folder_name = f"id_{real_id}_spin_{info['spin']}_charge_{info['charge']}"
+
+        # Look up the full path from our map.
+        folder_path = folder_path_map.get(folder_name)
+
+        if folder_path:
+            # Search for .log or .out files inside the found folder.
+            found_files = glob.glob(os.path.join(folder_path, '*.log')) + \
+                          glob.glob(os.path.join(folder_path, '*.out'))
+
+            if found_files:
+                log_path = os.path.abspath(found_files[0])
+                log_paths.append(log_path)
+                print(f"  - Found: {log_path}")
+                if len(found_files) > 1:
+                    warnings.warn(f"Multiple log files in {folder_path}. Using '{found_files[0]}'.")
+            else:
+                warnings.warn(f"Log file (.log or .out) not found inside folder: {folder_path}")
+        else:
+            # This means the folder for this specific ID was not found during the walk.
+            warnings.warn(f"Job folder '{folder_name}' not found anywhere under {results_root}")
+
+    return log_paths
+
 # Key word Pop=Full is required
-def get_convention(filename, dump_file=None, orbital_idx_map=orbital_idx_map):
-    nbasis = get_nbasis(filename)
-    basis_name = find_basis_set(filename)
-    orbitals, atom_to_orbitals, atom_to_simplified_orbitals, atom_to_dftio_orbitals, atom_to_transform_indices = parse_orbital_populations(
-        filename, nbasis, orbital_idx_map)
-    convention = {
-        'atom_to_simplified_orbitals': atom_to_simplified_orbitals,
-        'atom_to_dftio_orbitals': atom_to_dftio_orbitals,
-        'atom_to_transform_indices': atom_to_transform_indices,
-        'basis_name': basis_name,
+def get_convention(
+        filenames: Union[str, List[str]],
+        dump_file: str = None,
+        format: str = 'log',
+        orbital_idx_map: dict = orbital_idx_map
+) -> Dict[str, Any]:
+    """
+    Reads one or more Gaussian log files to extract and merge basis set convention information.
+
+    Args:
+        filenames (Union[str, List[str]]): A single log filename or a list of log filenames.
+        dump_file (str, optional): If provided, saves the final convention dict to this JSON file.
+        orbital_idx_map (dict, optional): Orbital index map.
+
+    Returns:
+        Dict[str, Any]: The merged convention dictionary containing information from all files.
+    """
+    # If a single filename (string) is passed, convert it to a list.
+    if isinstance(filenames, str):
+        filenames = [filenames]
+
+    # Initialize an empty convention dictionary to store merged results.
+    merged_convention = {
+        'atom_to_simplified_orbitals': {},
+        'atom_to_dftio_orbitals': {},
+        'atom_to_transform_indices': {},
+        'basis_name': None,
     }
+
+    # Process each file in the list.
+    for filename in filenames:
+        print(f"Processing file: {filename}...")
+
+        if format == 'log':
+            nbasis = get_nbasis(filename)
+            # Parse orbital info from the current file.
+            _, _, atom_to_simplified_orbitals, atom_to_dftio_orbitals, atom_to_transform_indices = parse_orbital_populations(
+                filename, nbasis, orbital_idx_map
+            )
+            basis_name = find_basis_set(filename)
+        elif format == 'fchk':
+            atoms = read_fchk(filename)
+            convention = atoms.info['convention']
+            atom_to_simplified_orbitals, atom_to_dftio_orbitals, atom_to_transform_indices = convention['atom_to_simplified_orbitals'], convention['atom_to_dftio_orbitals'], convention['atom_to_transform_indices']
+            basis_name = atoms.info['functional_basis']['basis_set']
+        else:
+            raise NotImplementedError
+
+        # Set the basis name from the first file and check for consistency in others.
+        if merged_convention['basis_name'] is None:
+            merged_convention['basis_name'] = basis_name
+        # Merge the dictionaries. The update() method adds new elements and overwrites existing ones.
+        merged_convention['atom_to_simplified_orbitals'].update(atom_to_simplified_orbitals)
+        merged_convention['atom_to_dftio_orbitals'].update(atom_to_dftio_orbitals)
+        merged_convention['atom_to_transform_indices'].update(atom_to_transform_indices)
+
+    # If a dump_file path is provided, save the result as a JSON file.
     if dump_file:
-        pprint(convention, compact=True)
+        print(f"\nDumping merged convention to {dump_file}...")
         with open(dump_file, 'w') as f:
-            json.dump(convention, f, indent=4)
-    return convention
+            json.dump(merged_convention, f, indent=4)
+
+    print("\nFinal Merged Convention:")
+    pprint(merged_convention, compact=True)
+
+    return merged_convention
 
 
 def check_eigenvalue_consistency(matrix, manipulated_matrix):
